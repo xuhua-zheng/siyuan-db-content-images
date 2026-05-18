@@ -1,0 +1,34 @@
+{
+  "name": "siyuan-db-content-images",
+  "author": "xuhua-zheng",
+  "url": "https://github.com/xuhua-zheng/siyuan-db-content-images",
+  "version": "0.1.5",
+  "minAppVersion": "3.6.4",
+  "backends": [
+    "all"
+  ],
+  "frontends": [
+    "all"
+  ],
+  "disabledInPublish": false,
+  "displayName": {
+    "default": "DB Content Images",
+    "zh_CN": "数据库内容图"
+  },
+  "description": {
+    "default": "Sync images in bound notes to a database asset field.",
+    "zh_CN": "将数据库行绑定笔记中的图片同步到资源字段。"
+  },
+  "readme": {
+    "default": "README.md",
+    "zh_CN": "README_zh_CN.md"
+  },
+  "keywords": [
+    "database",
+    "asset",
+    "image",
+    "数据库",
+    "资源",
+    "图片"
+  ]
+}
