@@ -2,7 +2,7 @@
   "name": "siyuan-db-content-images",
   "author": "xuhua-zheng",
   "url": "https://github.com/xuhua-zheng/siyuan-db-content-images",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "minAppVersion": "3.6.4",
   "backends": [
     "all"

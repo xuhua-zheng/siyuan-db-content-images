@@ -1,6 +1,6 @@
 {
   "name": "siyuan-db-content-images",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Sync images inside bound notes into a SiYuan database asset field.",
   "main": ".src/index.js",
   "scripts": {

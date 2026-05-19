@@ -248,6 +248,10 @@ export default class DbContentImagesPlugin extends Plugin {
         window.clearTimeout(this.autoSyncTimer);
     }
 
+    uninstall() {
+        this.removeData(STORAGE_NAME);
+    }
+
     private async loadSettings() {
         this.data[STORAGE_NAME] = {...defaultSettings};
         try {
