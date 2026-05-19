@@ -1,5 +1,5 @@
-import {Dialog, fetchPost, Plugin, Setting, showMessage} from "siyuan";
-import type {IMenu, IProtyle} from "siyuan";
+import {fetchPost, Plugin, Setting, showMessage} from "siyuan";
+import type {IMenu} from "siyuan";
 import "./index.scss";
 
 const STORAGE_NAME = "settings";
@@ -16,7 +16,7 @@ const IMAGE_EXTENSIONS = [
     ".svg",
     ".webp",
 ];
-const CONTENT_IMAGE_INSERT_ICON = `<svg class="b3-menu__icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="7" cy="5" rx="4" ry="2"/><path d="M3 5v5c0 1.1 1.8 2 4 2s4-.9 4-2V5"/><path d="M3 7.5c0 1.1 1.8 2 4 2s4-.9 4-2"/><path d="M11.5 8.2c2.4.3 4.3 1.7 5.4 3.8"/><path d="m14.6 11.8 2.7.8.8-2.7"/><rect x="11" y="13" width="9" height="6.5" rx="1.4"/><path d="m12.5 17.6 1.8-1.7 1.4 1.2 1.2-1 1.6 1.5"/><circle cx="17.7" cy="15" r=".6" fill="currentColor" stroke="none"/></svg>`;
+const AUTO_SYNC_DELAY_MS = 1500;
 const CONTENT_IMAGE_SYNC_ICON = `<svg class="b3-menu__icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="12.5" width="9" height="6.5" rx="1.4"/><path d="m4.5 17.1 1.8-1.7 1.4 1.2 1.2-1 1.6 1.5"/><circle cx="9.7" cy="14.5" r=".6" fill="currentColor" stroke="none"/><ellipse cx="16" cy="5" rx="4" ry="2"/><path d="M12 5v5c0 1.1 1.8 2 4 2s4-.9 4-2V5"/><path d="M12 7.5c0 1.1 1.8 2 4 2s4-.9 4-2"/><path d="M8.4 11.1c1.7-2.2 3.8-3.4 6.4-3.7"/><path d="m12.7 4.9 2.7 2.3-2.5 2.4"/></svg>`;
 
 interface PluginSettings {
@@ -107,9 +107,38 @@ interface BatchValue {
     value: AVCellValue;
 }
 
+interface SyncResult {
+    changed: number;
+    scanned: number;
+}
+
+interface DatabaseSyncResult extends SyncResult {
+    databases: number;
+    matchedItems: number;
+}
+
+interface SyncAVOptions {
+    onlyItemIDs?: string[];
+    emptyResultGuard?: boolean;
+}
+
+interface CollectImagesOptions {
+    preferKramdown?: boolean;
+}
+
+interface ImageCollection {
+    assets: Map<string, AVAsset[]>;
+    confirmedEmptyIDs: Set<string>;
+}
+
 interface AVKeyValues {
     key: AVColumn;
     values?: AVCellValue[];
+}
+
+interface BlockRootRow {
+    id: string;
+    root_id?: string;
 }
 
 interface BlockAttributeViewKeys {
@@ -117,31 +146,6 @@ interface BlockAttributeViewKeys {
     avName: string;
     blockIDs: string[];
     keyValues: AVKeyValues[];
-}
-
-interface BlockMarkdownRow {
-    id: string;
-    parent_id?: string;
-    sort?: number;
-    markdown?: string;
-}
-
-interface InsertBlockOperation {
-    id?: string;
-}
-
-interface InsertBlockTransaction {
-    doOperations?: InsertBlockOperation[];
-}
-
-interface ContentImageSource {
-    id: string;
-    avID: string;
-    avName: string;
-    fieldID: string;
-    fieldName: string;
-    itemID: string;
-    assets: AVAsset[];
 }
 
 interface AVMenuDetail {
@@ -152,16 +156,20 @@ interface AVMenuDetail {
     selectRowElements?: Iterable<Element> | ArrayLike<Element>;
 }
 
-interface ImageMenuDetail {
-    menu?: {
-        addItem(item: IMenu): void;
-    };
-    protyle?: IProtyle;
-    element?: HTMLElement;
+interface WsOperation {
+    action?: string;
+    id?: string;
+    rootID?: string;
+    parentID?: string;
+    previousID?: string;
+    nextID?: string;
+    blockID?: string;
+    blockIDs?: string[];
 }
 
-interface ContentMenuDetail extends ImageMenuDetail {
-    range?: Range;
+interface WsTransaction {
+    doOperations?: WsOperation[];
+    undoOperations?: WsOperation[];
 }
 
 const defaultSettings: PluginSettings = {
@@ -176,18 +184,17 @@ export default class DbContentImagesPlugin extends Plugin {
     private replaceExistingInput?: HTMLInputElement;
     private autoSyncInput?: HTMLInputElement;
     private autoSyncTimer = 0;
+    private imageObserver?: MutationObserver;
+    private pendingDocumentSyncIDs = new Set<string>();
     private syncingAvIDs = new Set<string>();
     private wsHandler = (event: CustomEvent) => this.handleWsEvent(event);
     private avMenuHandler = (event: CustomEvent) => this.addAVMenuItem(event);
-    private imageMenuHandler = (event: CustomEvent) => this.addImageMenuItem(event);
-    private contentMenuHandler = (event: CustomEvent) => this.addContentMenuItem(event);
 
     async onload() {
         await this.loadSettings();
         this.eventBus.on("ws-main", this.wsHandler);
         this.eventBus.on("open-menu-av", this.avMenuHandler);
-        this.eventBus.on("open-menu-image", this.imageMenuHandler);
-        this.eventBus.on("open-menu-content", this.contentMenuHandler);
+        this.updateDocumentImageObserver();
 
         this.addCommand({
             langKey: "syncCurrentDatabase",
@@ -243,8 +250,7 @@ export default class DbContentImagesPlugin extends Plugin {
     onunload() {
         this.eventBus.off("ws-main", this.wsHandler);
         this.eventBus.off("open-menu-av", this.avMenuHandler);
-        this.eventBus.off("open-menu-image", this.imageMenuHandler);
-        this.eventBus.off("open-menu-content", this.contentMenuHandler);
+        this.stopDocumentImageObserver();
         window.clearTimeout(this.autoSyncTimer);
     }
 
@@ -269,6 +275,7 @@ export default class DbContentImagesPlugin extends Plugin {
             autoSyncVisible: !!this.autoSyncInput?.checked,
         };
         await this.saveData(STORAGE_NAME, this.settingsData);
+        this.updateDocumentImageObserver();
         showMessage(this.i18n.settingsSaved);
     }
 
@@ -300,20 +307,13 @@ export default class DbContentImagesPlugin extends Plugin {
     }
 
     private async syncVisibleDatabases() {
-        const elements = this.findVisibleAVElements();
-        if (elements.length === 0) {
+        const result = await this.syncDatabaseElements(true);
+        if (result.databases === 0) {
             showMessage(this.i18n.noVisibleDatabase);
             return;
         }
 
-        let changed = 0;
-        let scanned = 0;
-        for (const element of elements) {
-            const result = await this.syncAVElement(element);
-            changed += result.changed;
-            scanned += result.scanned;
-        }
-        showMessage(this.i18n.syncSummary.replace("${changed}", `${changed}`).replace("${scanned}", `${scanned}`));
+        this.showSyncResult(result);
     }
 
     private async syncSelectedDatabaseItems(element: HTMLElement, itemIDs: string[]) {
@@ -323,11 +323,146 @@ export default class DbContentImagesPlugin extends Plugin {
             return;
         }
 
-        const result = await this.syncAVElement(element, itemIDs);
+        const result = await this.syncAVElement(element, {onlyItemIDs: itemIDs});
         this.showSyncResult(result);
     }
 
-    private async syncAVElement(element: HTMLElement, onlyItemIDs?: string[]) {
+    private async syncChangedDocumentBlocks(blockIDs: string[]) {
+        const contextIDs = await this.resolveContextBlockIDs(blockIDs);
+        if (contextIDs.length === 0) {
+            return {changed: 0, scanned: 0};
+        }
+
+        const entries = await this.getBoundAttributeViewEntries(contextIDs);
+        return this.syncBoundAttributeViewEntries(entries);
+    }
+
+    private async syncDatabaseElements(visibleOnly: boolean, emptyResultGuard = false): Promise<DatabaseSyncResult> {
+        const elements = this.findAVElements(visibleOnly);
+        let changed = 0;
+        let scanned = 0;
+        for (const element of elements) {
+            const result = await this.syncAVElement(element, {emptyResultGuard});
+            changed += result.changed;
+            scanned += result.scanned;
+        }
+        return {changed, scanned, databases: elements.length, matchedItems: scanned};
+    }
+
+    private async syncDatabaseItemsForBlocks(blockIDs: string[], visibleOnly: boolean, emptyResultGuard = false) {
+        const contextIDs = await this.resolveContextBlockIDs(blockIDs);
+        const contextIDSet = new Set(contextIDs);
+        if (contextIDSet.size === 0) {
+            return {changed: 0, scanned: 0, databases: 0, matchedItems: 0};
+        }
+
+        const elements = this.findAVElements(visibleOnly);
+        let changed = 0;
+        let scanned = 0;
+        let matchedItems = 0;
+        for (const element of elements) {
+            const itemIDs = await this.getDatabaseItemIDsByBoundBlocks(element, contextIDSet);
+            if (itemIDs.length === 0) {
+                continue;
+            }
+
+            matchedItems += itemIDs.length;
+            const result = await this.syncAVElement(element, {onlyItemIDs: itemIDs, emptyResultGuard});
+            changed += result.changed;
+            scanned += result.scanned;
+        }
+
+        return {changed, scanned, databases: elements.length, matchedItems};
+    }
+
+    private async getDatabaseItemIDsByBoundBlocks(element: HTMLElement, blockIDs: Set<string>) {
+        const result = await this.renderAttributeView(element);
+        const fields = this.getFields(result.view);
+        const assetField = this.findAssetField(fields);
+        if (!assetField) {
+            return [];
+        }
+
+        const fieldIndex = fields.findIndex((field) => field.id === assetField.id);
+        return this.collectBoundRows(this.collectRecords(result.view), fieldIndex, assetField.id)
+            .filter((row) => blockIDs.has(row.boundBlockID))
+            .map((row) => row.record.itemID);
+    }
+
+    private async syncBoundAttributeViewEntries(entries: BlockAttributeViewKeys[]) {
+        const targets: Array<{
+            avID: string;
+            itemID: string;
+            field: AVColumn;
+            value?: AVCellValue;
+        }> = [];
+        const seenTargets = new Set<string>();
+
+        for (const entry of entries) {
+            const itemID = this.getItemIDFromKeyValues(entry.keyValues);
+            if (!itemID) {
+                continue;
+            }
+
+            const target = this.findAssetKeyValue(entry.keyValues);
+            if (!target) {
+                continue;
+            }
+
+            const targetID = `${entry.avID}:${itemID}:${target.field.id}`;
+            if (seenTargets.has(targetID)) {
+                continue;
+            }
+            seenTargets.add(targetID);
+            targets.push({
+                avID: entry.avID,
+                itemID,
+                field: target.field,
+                value: target.value,
+            });
+        }
+
+        if (targets.length === 0) {
+            return {changed: 0, scanned: 0};
+        }
+
+        const imageCollection = await this.collectImages(targets.map((target) => target.itemID), {preferKramdown: true});
+        const updatesByAvID = new Map<string, BatchValue[]>();
+        let changed = 0;
+        for (const target of targets) {
+            const images = imageCollection.assets.get(target.itemID) || [];
+            const current = target.value?.mAsset || [];
+            if (images.length === 0 && current.length > 0 && !imageCollection.confirmedEmptyIDs.has(target.itemID)) {
+                console.debug(`[${this.name}] skip empty automatic sync result`, target.itemID);
+                continue;
+            }
+            if (this.sameAssets(current, images)) {
+                continue;
+            }
+
+            const updates = updatesByAvID.get(target.avID) || [];
+            updates.push({
+                keyID: target.field.id,
+                itemID: target.itemID,
+                value: {
+                    id: target.value?.id,
+                    keyID: target.field.id,
+                    blockID: target.itemID,
+                    type: "mAsset",
+                    mAsset: images,
+                },
+            });
+            updatesByAvID.set(target.avID, updates);
+            changed++;
+        }
+
+        for (const [avID, updates] of updatesByAvID) {
+            await this.updateCells(avID, updates);
+        }
+        return {changed, scanned: targets.length};
+    }
+
+    private async syncAVElement(element: HTMLElement, options: SyncAVOptions = {}) {
         const avID = element.getAttribute("data-av-id") || "";
         if (!avID) {
             return {changed: 0, scanned: 0};
@@ -345,19 +480,30 @@ export default class DbContentImagesPlugin extends Plugin {
                 throw new Error(this.i18n.noAssetField.replace("${field}", this.settingsData.assetFieldName));
             }
 
-            const onlyItems = new Set(onlyItemIDs || []);
+            const onlyItems = new Set(options.onlyItemIDs || []);
             let records = this.collectRecords(result.view);
             if (onlyItems.size > 0) {
                 records = records.filter((record) => onlyItems.has(record.itemID));
             }
             const fieldIndex = fields.findIndex((field) => field.id === assetField.id);
             const rows = this.collectBoundRows(records, fieldIndex, assetField.id);
-            const imageMap = await this.collectImages(rows.map((row) => row.boundBlockID));
+            const imageCollection = await this.collectImages(rows.map((row) => row.boundBlockID), {
+                preferKramdown: options.emptyResultGuard,
+            });
             const updates: BatchValue[] = [];
 
             for (const row of rows) {
-                const images = imageMap.get(row.boundBlockID) || [];
+                const images = imageCollection.assets.get(row.boundBlockID) || [];
                 const current = row.assetCell.value?.mAsset || [];
+                if (
+                    options.emptyResultGuard &&
+                    images.length === 0 &&
+                    current.length > 0 &&
+                    !imageCollection.confirmedEmptyIDs.has(row.boundBlockID)
+                ) {
+                    console.debug(`[${this.name}] skip empty automatic sync result`, row.record.itemID);
+                    continue;
+                }
                 if (!this.settingsData.replaceExisting && current.length > 0) {
                     continue;
                 }
@@ -414,288 +560,6 @@ export default class DbContentImagesPlugin extends Plugin {
     private getAVRowItemID(element: Element) {
         return element.getAttribute("data-id") ||
             element.querySelector('[data-dtype="block"] .av__celltext')?.getAttribute("data-id") ||
-            "";
-    }
-
-    private addImageMenuItem(event: CustomEvent) {
-        const detail = event.detail as ImageMenuDetail | undefined;
-        if (!detail?.menu || !(detail.element instanceof HTMLElement)) {
-            return;
-        }
-
-        const asset = this.getImageAssetFromMenuElement(detail.element);
-        if (!asset) {
-            return;
-        }
-
-        detail.menu.addItem({
-            id: "appendToContentImages",
-            icon: "iconImage",
-            label: this.i18n.appendToContentImages,
-            click: () => {
-                this.appendImageToBoundContentImages(detail, asset).catch((error) => this.showError(error));
-            },
-        });
-    }
-
-    private addContentMenuItem(event: CustomEvent) {
-        const detail = event.detail as ContentMenuDetail | undefined;
-        if (!detail?.menu || !(detail.element instanceof HTMLElement)) {
-            return;
-        }
-
-        detail.menu.addItem({
-            id: "insertContentImagesFromDatabase",
-            iconHTML: CONTENT_IMAGE_INSERT_ICON,
-            label: this.i18n.insertContentImagesFromDatabase,
-            click: () => {
-                this.insertContentImagesFromDatabase(detail).catch((error) => this.showError(error));
-            },
-        });
-    }
-
-    private getImageAssetFromMenuElement(element: HTMLElement) {
-        const imgElement = element.querySelector("img");
-        if (!imgElement) {
-            return undefined;
-        }
-
-        const content = imgElement.getAttribute("data-src") || imgElement.getAttribute("src") || "";
-        const name = imgElement.getAttribute("title") || imgElement.getAttribute("alt") || "";
-        return this.toImageAsset(content, name);
-    }
-
-    private async appendImageToBoundContentImages(detail: ImageMenuDetail, asset: AVAsset) {
-        await this.appendAssetsToBoundContentImages(detail, [asset]);
-    }
-
-    private async insertContentImagesFromDatabase(detail: ContentMenuDetail) {
-        const targetBlockID = this.getSelectedContentBlockID(detail);
-        if (!targetBlockID) {
-            showMessage(this.i18n.noCurrentBlock);
-            return;
-        }
-
-        const blockIDs = this.getImageContextBlockIDs(detail);
-        if (blockIDs.length === 0) {
-            showMessage(this.i18n.noCurrentBlock);
-            return;
-        }
-
-        const entries = await this.getBoundAttributeViewEntries(blockIDs);
-        if (entries.length === 0) {
-            showMessage(this.i18n.noBoundDatabase);
-            return;
-        }
-
-        const {matchedFields, sources} = this.getContentImageSources(entries);
-        if (matchedFields === 0) {
-            showMessage(this.i18n.noBoundAssetField.replace("${field}", this.settingsData.assetFieldName));
-            return;
-        }
-
-        const usableSources = sources.filter((source) => source.assets.length > 0);
-        if (usableSources.length === 0) {
-            showMessage(this.i18n.noContentImagesInDatabase);
-            return;
-        }
-
-        const source = await this.selectContentImageSource(usableSources);
-        if (!source) {
-            showMessage(this.i18n.selectSourceCanceled);
-            return;
-        }
-
-        const inserted = await this.insertAssetsAfterBlock(targetBlockID, source.assets);
-        if (inserted === 0) {
-            showMessage(this.i18n.contentImagesAlreadyInBlock);
-            return;
-        }
-
-        showMessage(this.i18n.insertSummary.replace("${count}", `${inserted}`));
-    }
-
-    private getContentImageSources(entries: BlockAttributeViewKeys[]) {
-        const sources: ContentImageSource[] = [];
-        const seenTargets = new Set<string>();
-        let matchedFields = 0;
-
-        for (const entry of entries) {
-            const itemID = this.getItemIDFromKeyValues(entry.keyValues);
-            if (!itemID) {
-                continue;
-            }
-
-            const target = this.findAssetKeyValue(entry.keyValues);
-            if (!target) {
-                continue;
-            }
-            matchedFields++;
-
-            const sourceID = `${entry.avID}:${itemID}:${target.field.id}`;
-            if (seenTargets.has(sourceID)) {
-                continue;
-            }
-            seenTargets.add(sourceID);
-
-            sources.push({
-                id: sourceID,
-                avID: entry.avID,
-                avName: entry.avName || entry.avID,
-                fieldID: target.field.id,
-                fieldName: target.field.name || this.settingsData.assetFieldName,
-                itemID,
-                assets: this.deduplicateAssets(target.value?.mAsset || []),
-            });
-        }
-
-        return {matchedFields, sources};
-    }
-
-    private async selectContentImageSource(sources: ContentImageSource[]) {
-        if (sources.length === 1) {
-            return sources[0];
-        }
-
-        return new Promise<ContentImageSource | undefined>((resolve) => {
-            let resolved = false;
-            const dialog = new Dialog({
-                title: this.i18n.selectContentImageSourceTitle,
-                width: "520px",
-                content: this.renderSourceDialogContent(sources),
-                destroyCallback: () => {
-                    if (!resolved) {
-                        resolved = true;
-                        resolve(undefined);
-                    }
-                },
-            });
-
-            dialog.element.querySelectorAll<HTMLButtonElement>("[data-source-index]").forEach((button) => {
-                button.addEventListener("click", () => {
-                    const source = sources[Number(button.dataset.sourceIndex)];
-                    resolved = true;
-                    dialog.destroy();
-                    resolve(source);
-                });
-            });
-        });
-    }
-
-    private renderSourceDialogContent(sources: ContentImageSource[]) {
-        return `<div class="db-content-images__source-dialog">
-    <div class="db-content-images__dialog-desc">${this.escapeHtml(this.i18n.selectContentImageSourceDesc)}</div>
-    <div class="db-content-images__source-list">
-        ${sources.map((source, index) => this.renderSourceButton(source, index)).join("")}
-    </div>
-</div>`;
-    }
-
-    private renderSourceButton(source: ContentImageSource, index: number) {
-        const title = this.interpolate(this.i18n.sourceTitle, {
-            database: source.avName,
-            field: source.fieldName,
-        });
-        const meta = this.interpolate(this.i18n.sourceMeta, {
-            item: source.itemID,
-            count: `${source.assets.length}`,
-        });
-        return `<button class="db-content-images__source" data-source-index="${index}">
-    <span class="db-content-images__source-title">${this.escapeHtml(title)}</span>
-    <span class="db-content-images__source-meta">${this.escapeHtml(meta)}</span>
-</button>`;
-    }
-
-    private async appendAssetsToBoundContentImages(detail: ImageMenuDetail, assets: AVAsset[]) {
-        const uniqueAssets = this.deduplicateAssets(assets);
-        if (uniqueAssets.length === 0) {
-            showMessage(this.i18n.noImagesInCurrentDocument);
-            return;
-        }
-
-        const blockIDs = this.getImageContextBlockIDs(detail);
-        if (blockIDs.length === 0) {
-            showMessage(this.i18n.noCurrentImageBlock);
-            return;
-        }
-
-        const entries = await this.getBoundAttributeViewEntries(blockIDs);
-        if (entries.length === 0) {
-            showMessage(this.i18n.noBoundDatabase);
-            return;
-        }
-
-        let matchedFields = 0;
-        let updated = 0;
-        const seenTargets = new Set<string>();
-        for (const entry of entries) {
-            const itemID = this.getItemIDFromKeyValues(entry.keyValues);
-            if (!itemID) {
-                continue;
-            }
-
-            const target = this.findAssetKeyValue(entry.keyValues);
-            if (!target) {
-                continue;
-            }
-            matchedFields++;
-
-            const targetID = `${entry.avID}:${itemID}:${target.field.id}`;
-            if (seenTargets.has(targetID)) {
-                continue;
-            }
-            seenTargets.add(targetID);
-
-            const current = target.value?.mAsset || [];
-            const next = this.deduplicateAssets([...current, ...uniqueAssets]);
-            if (this.sameAssets(current, next)) {
-                continue;
-            }
-
-            await this.post("/api/av/setAttributeViewBlockAttr", {
-                avID: entry.avID,
-                keyID: target.field.id,
-                itemID,
-                value: {
-                    id: target.value?.id,
-                    keyID: target.field.id,
-                    blockID: itemID,
-                    type: "mAsset",
-                    mAsset: next,
-                },
-            });
-            updated++;
-        }
-
-        if (matchedFields === 0) {
-            showMessage(this.i18n.noBoundAssetField.replace("${field}", this.settingsData.assetFieldName));
-            return;
-        }
-        if (updated === 0) {
-            showMessage(uniqueAssets.length > 1 ? this.i18n.imagesAlreadyInContentImages : this.i18n.imageAlreadyInContentImages);
-            return;
-        }
-
-        showMessage(this.i18n.appendSummary.replace("${updated}", `${updated}`).replace("${scanned}", `${matchedFields}`));
-    }
-
-    private getImageContextBlockIDs(detail: ImageMenuDetail) {
-        const ids: string[] = [];
-        const blockElement = detail.element?.closest("[data-node-id]");
-        const blockID = blockElement?.getAttribute("data-node-id") || "";
-        const rootID = detail.protyle?.block?.rootID || "";
-        if (blockID) {
-            ids.push(blockID);
-        }
-        if (rootID) {
-            ids.push(rootID);
-        }
-        return Array.from(new Set(ids));
-    }
-
-    private getSelectedContentBlockID(detail: ContentMenuDetail) {
-        return detail.element?.closest("[data-node-id]")?.getAttribute("data-node-id") ||
-            detail.protyle?.selectElement?.getAttribute("data-node-id") ||
             "";
     }
 
@@ -825,39 +689,50 @@ export default class DbContentImagesPlugin extends Plugin {
         return rows;
     }
 
-    private async collectImages(boundBlockIDs: string[]) {
+    private async collectImages(boundBlockIDs: string[], options: CollectImagesOptions = {}): Promise<ImageCollection> {
         const ids = Array.from(new Set(boundBlockIDs.filter(Boolean)));
         const imageMap = new Map<string, AVAsset[]>();
+        const confirmedEmptyIDs = new Set<string>();
         ids.forEach((id) => imageMap.set(id, []));
 
         if (ids.length === 0) {
-            return imageMap;
+            return {assets: imageMap, confirmedEmptyIDs};
         }
 
-        await Promise.all([
-            this.collectKramdownImages(ids, imageMap),
-            this.collectIndexedAssets(ids, imageMap),
-        ]);
+        const kramdownIDs = await this.collectKramdownImages(ids, imageMap, confirmedEmptyIDs);
+        const indexedIDs = options.preferKramdown ? ids.filter((id) => !kramdownIDs.has(id)) : ids;
+        if (indexedIDs.length > 0) {
+            await this.collectIndexedAssets(indexedIDs, imageMap);
+        }
 
         for (const [id, assets] of imageMap.entries()) {
             imageMap.set(id, this.deduplicateAssets(assets));
         }
-        return imageMap;
+        return {assets: imageMap, confirmedEmptyIDs};
     }
 
-    private async collectKramdownImages(ids: string[], imageMap: Map<string, AVAsset[]>) {
+    private async collectKramdownImages(ids: string[], imageMap: Map<string, AVAsset[]>, confirmedEmptyIDs: Set<string>) {
+        const checkedIDs = new Set<string>();
         try {
             const kramdowns = await this.post<Record<string, string>>("/api/block/getBlockKramdowns", {
                 ids,
                 mode: "md",
             });
             for (const id of ids) {
+                if (!Object.prototype.hasOwnProperty.call(kramdowns, id)) {
+                    continue;
+                }
+                checkedIDs.add(id);
                 const assets = this.extractImageLinks(kramdowns[id] || "");
+                if (assets.length === 0) {
+                    confirmedEmptyIDs.add(id);
+                }
                 imageMap.get(id)?.push(...assets);
             }
         } catch (error) {
             console.debug(`[${this.name}] getBlockKramdowns failed`, error);
         }
+        return checkedIDs;
     }
 
     private async collectIndexedAssets(ids: string[], imageMap: Map<string, AVAsset[]>) {
@@ -901,63 +776,6 @@ export default class DbContentImagesPlugin extends Plugin {
         }
     }
 
-    private async insertAssetsAfterBlock(blockID: string, assets: AVAsset[]) {
-        const existingContents = await this.getNearbyImageContents(blockID, assets.length + 8);
-        const assetsToInsert = assets.filter((asset) => !existingContents.has(asset.content));
-        if (assetsToInsert.length === 0) {
-            return 0;
-        }
-
-        const data = assetsToInsert.map((asset) => this.toImageMarkdown(asset)).join("\n\n");
-        await this.post<InsertBlockTransaction[]>("/api/block/insertBlock", {
-            dataType: "markdown",
-            data,
-            previousID: blockID,
-            nextID: "",
-            parentID: "",
-        });
-        return assetsToInsert.length;
-    }
-
-    private async getNearbyImageContents(blockID: string, nearbyCount: number) {
-        const contents = new Set<string>();
-        try {
-            const rows = await this.getNearbyMarkdownRows(blockID, Math.max(16, nearbyCount));
-            for (const row of rows) {
-                for (const asset of this.extractImageLinks(row.markdown || "")) {
-                    contents.add(asset.content);
-                }
-            }
-        } catch (error) {
-            console.debug(`[${this.name}] nearby image query failed`, error);
-        }
-        return contents;
-    }
-
-    private async getNearbyMarkdownRows(blockID: string, limit: number) {
-        const currentRows = await this.post<BlockMarkdownRow[]>("/api/query/sql", {
-            stmt: `SELECT id, parent_id, sort, markdown FROM blocks WHERE id = ${this.sqlString(blockID)} LIMIT 1`,
-        });
-        const current = currentRows[0];
-        if (!current) {
-            return [];
-        }
-
-        const parentID = current.parent_id || "";
-        const rawSort = Number(current.sort || 0);
-        const sort = isFinite(rawSort) ? rawSort : 0;
-        const safeLimit = Math.max(1, Math.floor(limit));
-        return this.post<BlockMarkdownRow[]>("/api/query/sql", {
-            stmt: `SELECT id, markdown FROM blocks WHERE parent_id = ${this.sqlString(parentID)} AND sort >= ${sort} ORDER BY sort LIMIT ${safeLimit}`,
-        });
-    }
-
-    private toImageMarkdown(asset: AVAsset) {
-        const alt = asset.name.replace(/\\/g, "\\\\").replace(/]/g, "\\]");
-        const destination = /[\s()<>]/.test(asset.content) ? `<${asset.content.replace(/>/g, "%3E")}>` : asset.content;
-        return `![${alt}](${destination})`;
-    }
-
     private extractImageLinks(markdown: string) {
         const assets: AVAsset[] = [];
         const markdownImage = /!\[[^\]]*]\(([^)]*)\)/g;
@@ -969,7 +787,7 @@ export default class DbContentImagesPlugin extends Plugin {
             }
         }
 
-        const htmlImage = /<img\b[^>]*\bsrc=(["'])(.*?)\1/gi;
+        const htmlImage = /<img\b[^>]*\b(?:src|data-src)=(["'])(.*?)\1/gi;
         while ((match = htmlImage.exec(markdown)) !== null) {
             const asset = this.toImageAsset(match[2]);
             if (asset) {
@@ -1062,15 +880,16 @@ export default class DbContentImagesPlugin extends Plugin {
         }
 
         return document.querySelector(".protyle:not(.fn__none) .av[data-av-id]") as HTMLElement ||
-            document.querySelector(".av[data-av-id]") as HTMLElement | null;
+            this.findAVElements(false)[0] ||
+            null;
     }
 
-    private findVisibleAVElements() {
+    private findAVElements(visibleOnly: boolean) {
         const elements = Array.from(document.querySelectorAll(".av[data-av-id]")) as HTMLElement[];
         const seen = new Set<string>();
         return elements.filter((element) => {
             const id = element.getAttribute("data-av-id") || "";
-            if (!id || seen.has(id) || element.offsetParent === null) {
+            if (!id || seen.has(id) || (visibleOnly && element.offsetParent === null)) {
                 return false;
             }
             seen.add(id);
@@ -1079,28 +898,244 @@ export default class DbContentImagesPlugin extends Plugin {
     }
 
     private handleWsEvent(event: CustomEvent) {
-        if (!this.settingsData.autoSyncVisible || !this.isAttrViewMutation(event.detail)) {
+        if (!this.settingsData.autoSyncVisible) {
             return;
         }
 
-        window.clearTimeout(this.autoSyncTimer);
-        this.autoSyncTimer = window.setTimeout(() => {
-            this.syncVisibleDatabases().catch((error) => this.showError(error));
-        }, 800);
+        const blockIDs = this.getDocumentMutationBlockIDs(event.detail);
+        if (blockIDs.length === 0) {
+            return;
+        }
+
+        this.scheduleDocumentSync(blockIDs);
     }
 
-    private isAttrViewMutation(detail: unknown) {
-        const data = detail as {cmd?: string; data?: Array<{doOperations?: Array<{action?: string}>}>} | undefined;
-        if (data?.cmd !== "transactions" || !Array.isArray(data.data)) {
+    private updateDocumentImageObserver() {
+        if (this.settingsData.autoSyncVisible) {
+            this.startDocumentImageObserver();
+            return;
+        }
+
+        this.stopDocumentImageObserver();
+    }
+
+    private startDocumentImageObserver() {
+        if (this.imageObserver || typeof MutationObserver === "undefined") {
+            return;
+        }
+
+        this.imageObserver = new MutationObserver((records) => this.handleDocumentImageMutations(records));
+        this.imageObserver.observe(document.body, {
+            attributeFilter: ["src", "data-src"],
+            attributeOldValue: true,
+            attributes: true,
+            childList: true,
+            subtree: true,
+        });
+    }
+
+    private stopDocumentImageObserver() {
+        this.imageObserver?.disconnect();
+        this.imageObserver = undefined;
+    }
+
+    private handleDocumentImageMutations(records: MutationRecord[]) {
+        if (!this.settingsData.autoSyncVisible) {
+            return;
+        }
+
+        const blockIDs: string[] = [];
+        for (const record of records) {
+            if (record.type === "attributes") {
+                const blockID = this.getImageAttributeChangeBlockID(record);
+                if (blockID) {
+                    blockIDs.push(blockID);
+                }
+                continue;
+            }
+
+            const blockID = this.getChildImageChangeBlockID(record);
+            if (blockID) {
+                blockIDs.push(blockID);
+            }
+        }
+
+        if (blockIDs.length > 0) {
+            this.scheduleDocumentSync(blockIDs);
+        }
+    }
+
+    private getImageAttributeChangeBlockID(record: MutationRecord) {
+        if (!(record.target instanceof HTMLImageElement)) {
+            return "";
+        }
+
+        const blockID = this.getImageMutationBlockID(record.target);
+        if (!blockID) {
+            return "";
+        }
+
+        const added = this.toImageAsset(this.getImageElementContent(record.target) || "");
+        const removed = this.toImageAsset(record.oldValue || "");
+        if (!added && !removed) {
+            return "";
+        }
+
+        if (added && removed && added.content === removed.content) {
+            return "";
+        }
+
+        return blockID;
+    }
+
+    private getChildImageChangeBlockID(record: MutationRecord) {
+        if (!this.hasImageAssetNode(record.addedNodes) && !this.hasImageAssetNode(record.removedNodes)) {
+            return "";
+        }
+
+        return this.getImageMutationBlockID(record.target) ||
+            Array.from(record.addedNodes).map((node) => this.getImageMutationBlockID(node)).find(Boolean) ||
+            Array.from(record.removedNodes).map((node) => this.getImageMutationBlockID(node)).find(Boolean) ||
+            "";
+    }
+
+    private hasImageAssetNode(nodes: NodeList) {
+        return Array.from(nodes).some((node) => this.hasImageAsset(node));
+    }
+
+    private hasImageAsset(node: Node) {
+        if (!(node instanceof HTMLElement)) {
             return false;
         }
 
-        return data.data.some((transaction) =>
-            (transaction.doOperations || []).some((operation) =>
-                operation.action === "insertAttrViewBlock" ||
-                operation.action === "updateAttrViewCell" ||
-                operation.action === "setAttrViewBlockView" ||
-                (operation.action || "").startsWith("setAttrViewCol")));
+        if (node instanceof HTMLImageElement) {
+            return !!this.toImageAsset(this.getImageElementContent(node) || "");
+        }
+
+        return Array.from(node.querySelectorAll("img")).some((img) =>
+            !!this.toImageAsset(this.getImageElementContent(img) || ""));
+    }
+
+    private getImageElementContent(element: HTMLImageElement) {
+        return element.getAttribute("data-src") || element.getAttribute("src") || "";
+    }
+
+    private getImageMutationBlockID(target: Node) {
+        const element = target instanceof HTMLElement ? target : target.parentElement;
+        const blockElement = element?.closest("[data-node-id]");
+        if (!(blockElement instanceof HTMLElement) || blockElement.closest(".av")) {
+            return "";
+        }
+
+        return blockElement.getAttribute("data-node-id") || "";
+    }
+
+    private scheduleDocumentSync(blockIDs: string[]) {
+        blockIDs.forEach((id) => this.pendingDocumentSyncIDs.add(id));
+        window.clearTimeout(this.autoSyncTimer);
+        this.autoSyncTimer = window.setTimeout(() => {
+            this.flushPendingDocumentSync().catch((error) => this.showError(error));
+        }, AUTO_SYNC_DELAY_MS);
+    }
+
+    private async flushPendingDocumentSync() {
+        const blockIDs = Array.from(this.pendingDocumentSyncIDs);
+        this.pendingDocumentSyncIDs.clear();
+        if (blockIDs.length === 0) {
+            return;
+        }
+
+        const openTargetResult = await this.syncDatabaseItemsForBlocks(blockIDs, false, true);
+        if (openTargetResult.matchedItems > 0) {
+            return;
+        }
+
+        const openResult = await this.syncDatabaseElements(false, true);
+        if (openResult.databases > 0) {
+            return;
+        }
+
+        await this.syncChangedDocumentBlocks(blockIDs);
+    }
+
+    private getDocumentMutationBlockIDs(detail: unknown) {
+        const data = detail as {cmd?: string; data?: WsTransaction[]} | undefined;
+        if (data?.cmd !== "transactions" || !Array.isArray(data.data)) {
+            return [];
+        }
+
+        const ids: string[] = [];
+        for (const transaction of data.data) {
+            const operations = [
+                ...(transaction.doOperations || []),
+                ...(transaction.undoOperations || []),
+            ];
+            for (const operation of operations) {
+                if (!this.isDocumentMutationAction(operation.action || "")) {
+                    continue;
+                }
+                this.collectOperationBlockIDs(operation, ids);
+            }
+        }
+        return Array.from(new Set(ids));
+    }
+
+    private isDocumentMutationAction(action: string) {
+        if (!action || action.includes("AttrView")) {
+            return false;
+        }
+
+        return [
+            "update",
+            "insert",
+            "delete",
+            "move",
+            "append",
+            "appendInsert",
+            "prependInsert",
+        ].indexOf(action) >= 0;
+    }
+
+    private collectOperationBlockIDs(operation: WsOperation, ids: string[]) {
+        [
+            operation.id,
+            operation.rootID,
+            operation.parentID,
+            operation.previousID,
+            operation.nextID,
+            operation.blockID,
+        ].forEach((id) => {
+            if (id) {
+                ids.push(id);
+            }
+        });
+        (operation.blockIDs || []).forEach((id) => ids.push(id));
+    }
+
+    private async resolveContextBlockIDs(blockIDs: string[]) {
+        const ids = Array.from(new Set(blockIDs.filter(Boolean)));
+        if (ids.length === 0) {
+            return [];
+        }
+
+        const contextIDs = new Set(ids);
+        try {
+            const rows = await this.post<BlockRootRow[]>("/api/query/sql", {
+                stmt: `SELECT id, root_id FROM blocks WHERE id IN (${ids.map((id) => this.sqlString(id)).join(",")})`,
+            });
+            for (const row of rows || []) {
+                if (row.id) {
+                    contextIDs.add(row.id);
+                }
+                if (row.root_id) {
+                    contextIDs.add(row.root_id);
+                }
+            }
+        } catch (error) {
+            console.debug(`[${this.name}] resolve changed block roots failed`, error);
+        }
+
+        return Array.from(contextIDs);
     }
 
     private post<T>(url: string, data: unknown): Promise<T> {
@@ -1123,16 +1158,6 @@ export default class DbContentImagesPlugin extends Plugin {
         const textarea = document.createElement("textarea");
         textarea.innerHTML = value;
         return textarea.value;
-    }
-
-    private escapeHtml(value: string) {
-        const div = document.createElement("div");
-        div.textContent = value;
-        return div.innerHTML;
-    }
-
-    private interpolate(template: string, values: Record<string, string>) {
-        return template.replace(/\$\{(\w+)}/g, (match, key) => values[key] ?? match);
     }
 
     private showSyncResult(result: {changed: number; scanned: number}) {
