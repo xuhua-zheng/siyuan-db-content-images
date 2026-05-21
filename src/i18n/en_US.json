@@ -8,7 +8,7 @@
   "replaceExisting": "Replace existing assets",
   "replaceExistingDesc": "Only affects manual sync from the database context menu or command palette. Auto-sync clears confirmed empty document content, otherwise keeping the empty-result guard.",
   "autoSyncVisible": "Auto-sync document images",
-  "autoSyncVisibleDesc": "After document image changes, first sync matching items in opened databases, including background tabs. Confirmed empty document content clears the asset field; uncertain empty scans are still protected.",
+  "autoSyncVisibleDesc": "After document image changes, only handle database items bound to the current block/document. Unbound documents are skipped silently. Bound items that cannot sync immediately are stored in a pending queue and retried when the database opens; this never syncs every opened database.",
   "settingsSaved": "DB Content Images settings saved",
   "noCurrentDatabase": "Put the cursor in a database first, or open a document that contains a database.",
   "noVisibleDatabase": "No visible database is available to sync.",

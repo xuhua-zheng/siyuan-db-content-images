@@ -3,6 +3,7 @@ import type {IMenu} from "siyuan";
 import "./index.scss";
 
 const STORAGE_NAME = "settings";
+const PENDING_SYNC_STORAGE = "pending-sync";
 const CUSTOM_SY_AV_VIEW = "custom-sy-av-view";
 const DEFAULT_ASSET_FIELD_NAME = "内容图";
 const IMAGE_EXTENSIONS = [
@@ -17,6 +18,8 @@ const IMAGE_EXTENSIONS = [
     ".webp",
 ];
 const AUTO_SYNC_DELAY_MS = 1500;
+const PENDING_SYNC_MAX_ITEMS = 500;
+const PENDING_SYNC_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const CONTENT_IMAGE_SYNC_ICON = `<svg class="b3-menu__icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="12.5" width="9" height="6.5" rx="1.4"/><path d="m4.5 17.1 1.8-1.7 1.4 1.2 1.2-1 1.6 1.5"/><circle cx="9.7" cy="14.5" r=".6" fill="currentColor" stroke="none"/><ellipse cx="16" cy="5" rx="4" ry="2"/><path d="M12 5v5c0 1.1 1.8 2 4 2s4-.9 4-2V5"/><path d="M12 7.5c0 1.1 1.8 2 4 2s4-.9 4-2"/><path d="M8.4 11.1c1.7-2.2 3.8-3.4 6.4-3.7"/><path d="m12.7 4.9 2.7 2.3-2.5 2.4"/></svg>`;
 
 interface PluginSettings {
@@ -110,11 +113,13 @@ interface BatchValue {
 interface SyncResult {
     changed: number;
     scanned: number;
+    skipped?: number;
 }
 
 interface DatabaseSyncResult extends SyncResult {
     databases: number;
     matchedItems: number;
+    matchedContextIDs: string[];
 }
 
 interface SyncAVOptions {
@@ -146,6 +151,26 @@ interface BlockAttributeViewKeys {
     avName: string;
     blockIDs: string[];
     keyValues: AVKeyValues[];
+}
+
+interface PendingBoundItem {
+    avID: string;
+    avName: string;
+    itemID: string;
+    fieldID: string;
+    fieldName: string;
+}
+
+interface PendingSyncItem {
+    changedBlockID: string;
+    contextIDs: string[];
+    boundItems: PendingBoundItem[];
+    updatedAt: number;
+    attempts: number;
+}
+
+interface PendingSyncData {
+    items: PendingSyncItem[];
 }
 
 interface AVMenuDetail {
@@ -184,14 +209,20 @@ export default class DbContentImagesPlugin extends Plugin {
     private replaceExistingInput?: HTMLInputElement;
     private autoSyncInput?: HTMLInputElement;
     private autoSyncTimer = 0;
+    private pendingSyncFlushTimer = 0;
+    private documentSyncRunning = false;
+    private pendingSyncRunning = false;
     private imageObserver?: MutationObserver;
+    private databaseObserver?: MutationObserver;
     private pendingDocumentSyncIDs = new Set<string>();
+    private pendingSyncData: PendingSyncData = {items: []};
     private syncingAvIDs = new Set<string>();
     private wsHandler = (event: CustomEvent) => this.handleWsEvent(event);
     private avMenuHandler = (event: CustomEvent) => this.addAVMenuItem(event);
 
     async onload() {
         await this.loadSettings();
+        await this.loadPendingSyncData();
         this.eventBus.on("ws-main", this.wsHandler);
         this.eventBus.on("open-menu-av", this.avMenuHandler);
         this.updateDocumentImageObserver();
@@ -251,11 +282,14 @@ export default class DbContentImagesPlugin extends Plugin {
         this.eventBus.off("ws-main", this.wsHandler);
         this.eventBus.off("open-menu-av", this.avMenuHandler);
         this.stopDocumentImageObserver();
+        this.stopDatabaseObserver();
         window.clearTimeout(this.autoSyncTimer);
+        window.clearTimeout(this.pendingSyncFlushTimer);
     }
 
     uninstall() {
         this.removeData(STORAGE_NAME);
+        this.removeData(PENDING_SYNC_STORAGE);
     }
 
     private async loadSettings() {
@@ -266,6 +300,25 @@ export default class DbContentImagesPlugin extends Plugin {
             console.debug(`[${this.name}] load settings failed`, error);
         }
         this.settingsData = this.normalizeSettings(this.data[STORAGE_NAME]);
+    }
+
+    private async loadPendingSyncData() {
+        this.data[PENDING_SYNC_STORAGE] = {items: []};
+        try {
+            await this.loadData(PENDING_SYNC_STORAGE);
+        } catch (error) {
+            console.debug(`[${this.name}] load pending sync failed`, error);
+        }
+
+        this.pendingSyncData = this.normalizePendingSyncData(this.data[PENDING_SYNC_STORAGE]);
+        if (this.prunePendingSyncData()) {
+            await this.savePendingSyncData();
+        }
+    }
+
+    private async savePendingSyncData() {
+        this.pendingSyncData = this.normalizePendingSyncData(this.pendingSyncData);
+        await this.saveData(PENDING_SYNC_STORAGE, this.pendingSyncData);
     }
 
     private async saveSettingsFromInputs() {
@@ -285,6 +338,58 @@ export default class DbContentImagesPlugin extends Plugin {
             assetFieldName: (data?.assetFieldName || DEFAULT_ASSET_FIELD_NAME).trim() || DEFAULT_ASSET_FIELD_NAME,
             replaceExisting: typeof data?.replaceExisting === "boolean" ? data.replaceExisting : defaultSettings.replaceExisting,
             autoSyncVisible: typeof data?.autoSyncVisible === "boolean" ? data.autoSyncVisible : defaultSettings.autoSyncVisible,
+        };
+    }
+
+    private normalizePendingSyncData(raw: unknown): PendingSyncData {
+        const data = raw as Partial<PendingSyncData> | undefined;
+        const items = Array.isArray(data?.items) ? data.items : [];
+        return {
+            items: items
+                .map((item) => this.normalizePendingSyncItem(item))
+                .filter((item): item is PendingSyncItem => !!item),
+        };
+    }
+
+    private normalizePendingSyncItem(raw: unknown): PendingSyncItem | undefined {
+        const item = raw as Partial<PendingSyncItem> | undefined;
+        const changedBlockID = typeof item?.changedBlockID === "string" ? item.changedBlockID : "";
+        const contextIDs = Array.isArray(item?.contextIDs) ?
+            Array.from(new Set(item.contextIDs.filter((id): id is string => typeof id === "string" && id.length > 0))) :
+            [];
+        const boundItems = Array.isArray(item?.boundItems) ?
+            item.boundItems
+                .map((boundItem) => this.normalizePendingBoundItem(boundItem))
+                .filter((boundItem): boundItem is PendingBoundItem => !!boundItem) :
+            [];
+
+        if (!changedBlockID || contextIDs.length === 0 || boundItems.length === 0) {
+            return undefined;
+        }
+
+        return {
+            changedBlockID,
+            contextIDs,
+            boundItems,
+            updatedAt: typeof item?.updatedAt === "number" ? item.updatedAt : Date.now(),
+            attempts: typeof item?.attempts === "number" ? item.attempts : 0,
+        };
+    }
+
+    private normalizePendingBoundItem(raw: unknown): PendingBoundItem | undefined {
+        const item = raw as Partial<PendingBoundItem> | undefined;
+        const avID = typeof item?.avID === "string" ? item.avID : "";
+        const itemID = typeof item?.itemID === "string" ? item.itemID : "";
+        if (!avID || !itemID) {
+            return undefined;
+        }
+
+        return {
+            avID,
+            avName: typeof item?.avName === "string" ? item.avName : "",
+            itemID,
+            fieldID: typeof item?.fieldID === "string" ? item.fieldID : "",
+            fieldName: typeof item?.fieldName === "string" ? item.fieldName : "",
         };
     }
 
@@ -328,54 +433,86 @@ export default class DbContentImagesPlugin extends Plugin {
     }
 
     private async syncChangedDocumentBlocks(blockIDs: string[]) {
-        const contextIDs = await this.resolveContextBlockIDs(blockIDs);
-        if (contextIDs.length === 0) {
+        const context = await this.resolveBoundDocumentSyncContext(blockIDs);
+        if (context.entries.length === 0) {
             return {changed: 0, scanned: 0};
         }
 
+        return this.syncBoundAttributeViewEntries(context.entries);
+    }
+
+    private async resolveBoundDocumentSyncContext(blockIDs: string[]) {
+        const contextIDs = await this.resolveContextBlockIDs(blockIDs);
+        if (contextIDs.length === 0) {
+            return {contextIDs, entries: [], boundItems: []};
+        }
+
         const entries = await this.getBoundAttributeViewEntries(contextIDs);
-        return this.syncBoundAttributeViewEntries(entries);
+        return {
+            contextIDs,
+            entries,
+            boundItems: this.getPendingBoundItems(entries),
+        };
     }
 
     private async syncDatabaseElements(visibleOnly: boolean, emptyResultGuard = false): Promise<DatabaseSyncResult> {
         const elements = this.findAVElements(visibleOnly);
         let changed = 0;
         let scanned = 0;
+        let skipped = 0;
         for (const element of elements) {
             const result = await this.syncAVElement(element, {emptyResultGuard});
             changed += result.changed;
             scanned += result.scanned;
+            skipped += result.skipped || 0;
         }
-        return {changed, scanned, databases: elements.length, matchedItems: scanned};
+        return {changed, scanned, skipped, databases: elements.length, matchedItems: scanned, matchedContextIDs: []};
     }
 
-    private async syncDatabaseItemsForBlocks(blockIDs: string[], visibleOnly: boolean, emptyResultGuard = false) {
+    private async syncDatabaseItemsForBlocks(blockIDs: string[], visibleOnly: boolean, emptyResultGuard = false): Promise<DatabaseSyncResult> {
         const contextIDs = await this.resolveContextBlockIDs(blockIDs);
+        return this.syncDatabaseItemsForContextIDs(contextIDs, visibleOnly, emptyResultGuard);
+    }
+
+    private async syncDatabaseItemsForContextIDs(
+        contextIDs: string[],
+        visibleOnly: boolean,
+        emptyResultGuard = false,
+        avIDs?: Set<string>,
+    ): Promise<DatabaseSyncResult> {
         const contextIDSet = new Set(contextIDs);
         if (contextIDSet.size === 0) {
-            return {changed: 0, scanned: 0, databases: 0, matchedItems: 0};
+            return {changed: 0, scanned: 0, databases: 0, matchedItems: 0, matchedContextIDs: []};
         }
 
-        const elements = this.findAVElements(visibleOnly);
+        const elements = this.findAVElements(visibleOnly)
+            .filter((element) => !avIDs || avIDs.has(element.getAttribute("data-av-id") || ""));
         let changed = 0;
         let scanned = 0;
+        let skipped = 0;
         let matchedItems = 0;
+        const matchedContextIDs = new Set<string>();
         for (const element of elements) {
-            const itemIDs = await this.getDatabaseItemIDsByBoundBlocks(element, contextIDSet);
-            if (itemIDs.length === 0) {
+            const items = await this.getDatabaseItemsByBoundBlocks(element, contextIDSet);
+            if (items.length === 0) {
                 continue;
             }
 
-            matchedItems += itemIDs.length;
-            const result = await this.syncAVElement(element, {onlyItemIDs: itemIDs, emptyResultGuard});
+            matchedItems += items.length;
+            items.forEach((item) => matchedContextIDs.add(item.boundBlockID));
+            const result = await this.syncAVElement(element, {
+                onlyItemIDs: items.map((item) => item.itemID),
+                emptyResultGuard,
+            });
             changed += result.changed;
             scanned += result.scanned;
+            skipped += result.skipped || 0;
         }
 
-        return {changed, scanned, databases: elements.length, matchedItems};
+        return {changed, scanned, skipped, databases: elements.length, matchedItems, matchedContextIDs: Array.from(matchedContextIDs)};
     }
 
-    private async getDatabaseItemIDsByBoundBlocks(element: HTMLElement, blockIDs: Set<string>) {
+    private async getDatabaseItemsByBoundBlocks(element: HTMLElement, blockIDs: Set<string>) {
         const result = await this.renderAttributeView(element);
         const fields = this.getFields(result.view);
         const assetField = this.findAssetField(fields);
@@ -386,7 +523,7 @@ export default class DbContentImagesPlugin extends Plugin {
         const fieldIndex = fields.findIndex((field) => field.id === assetField.id);
         return this.collectBoundRows(this.collectRecords(result.view), fieldIndex, assetField.id)
             .filter((row) => blockIDs.has(row.boundBlockID))
-            .map((row) => row.record.itemID);
+            .map((row) => ({itemID: row.record.itemID, boundBlockID: row.boundBlockID}));
     }
 
     private async syncBoundAttributeViewEntries(entries: BlockAttributeViewKeys[]) {
@@ -429,11 +566,13 @@ export default class DbContentImagesPlugin extends Plugin {
         const imageCollection = await this.collectImages(targets.map((target) => target.itemID), {preferKramdown: true});
         const updatesByAvID = new Map<string, BatchValue[]>();
         let changed = 0;
+        let skipped = 0;
         for (const target of targets) {
             const images = imageCollection.assets.get(target.itemID) || [];
             const current = target.value?.mAsset || [];
             if (images.length === 0 && current.length > 0 && !imageCollection.confirmedEmptyIDs.has(target.itemID)) {
                 console.debug(`[${this.name}] skip empty automatic sync result`, target.itemID);
+                skipped++;
                 continue;
             }
             if (this.sameAssets(current, images)) {
@@ -459,7 +598,7 @@ export default class DbContentImagesPlugin extends Plugin {
         for (const [avID, updates] of updatesByAvID) {
             await this.updateCells(avID, updates);
         }
-        return {changed, scanned: targets.length};
+        return {changed, scanned: targets.length, skipped};
     }
 
     private async syncAVElement(element: HTMLElement, options: SyncAVOptions = {}) {
@@ -491,6 +630,7 @@ export default class DbContentImagesPlugin extends Plugin {
                 preferKramdown: options.emptyResultGuard,
             });
             const updates: BatchValue[] = [];
+            let skipped = 0;
 
             for (const row of rows) {
                 const images = imageCollection.assets.get(row.boundBlockID) || [];
@@ -502,6 +642,7 @@ export default class DbContentImagesPlugin extends Plugin {
                     !imageCollection.confirmedEmptyIDs.has(row.boundBlockID)
                 ) {
                     console.debug(`[${this.name}] skip empty automatic sync result`, row.record.itemID);
+                    skipped++;
                     continue;
                 }
                 if (!this.settingsData.replaceExisting && current.length > 0) {
@@ -527,7 +668,7 @@ export default class DbContentImagesPlugin extends Plugin {
                 await this.updateCells(avID, updates);
             }
 
-            return {changed: updates.length, scanned: rows.length};
+            return {changed: updates.length, scanned: rows.length, skipped};
         } finally {
             this.syncingAvIDs.delete(avID);
         }
@@ -598,6 +739,38 @@ export default class DbContentImagesPlugin extends Plugin {
             field,
             value: keyValue?.values?.[0],
         };
+    }
+
+    private getPendingBoundItems(entries: BlockAttributeViewKeys[]) {
+        const items: PendingBoundItem[] = [];
+        const seen = new Set<string>();
+        for (const entry of entries) {
+            const itemID = this.getItemIDFromKeyValues(entry.keyValues);
+            if (!entry.avID || !itemID) {
+                continue;
+            }
+
+            const assetKeyValue = this.findAssetKeyValue(entry.keyValues);
+            const item: PendingBoundItem = {
+                avID: entry.avID,
+                avName: entry.avName || "",
+                itemID,
+                fieldID: assetKeyValue?.field.id || "",
+                fieldName: assetKeyValue?.field.name || "",
+            };
+            const key = this.getPendingBoundItemKey(item);
+            if (seen.has(key)) {
+                continue;
+            }
+
+            seen.add(key);
+            items.push(item);
+        }
+        return items;
+    }
+
+    private getPendingBoundItemKey(item: PendingBoundItem) {
+        return `${item.avID}:${item.itemID}:${item.fieldID}`;
     }
 
     private async renderAttributeView(element: HTMLElement) {
@@ -913,10 +1086,13 @@ export default class DbContentImagesPlugin extends Plugin {
     private updateDocumentImageObserver() {
         if (this.settingsData.autoSyncVisible) {
             this.startDocumentImageObserver();
+            this.startDatabaseObserver();
+            this.schedulePendingSyncFlush(0);
             return;
         }
 
         this.stopDocumentImageObserver();
+        this.stopDatabaseObserver();
     }
 
     private startDocumentImageObserver() {
@@ -937,6 +1113,42 @@ export default class DbContentImagesPlugin extends Plugin {
     private stopDocumentImageObserver() {
         this.imageObserver?.disconnect();
         this.imageObserver = undefined;
+    }
+
+    private startDatabaseObserver() {
+        if (this.databaseObserver || typeof MutationObserver === "undefined") {
+            return;
+        }
+
+        this.databaseObserver = new MutationObserver((records) => {
+            if (!this.settingsData.autoSyncVisible || this.pendingSyncData.items.length === 0) {
+                return;
+            }
+
+            if (records.some((record) => this.hasAVElementNode(record.addedNodes))) {
+                this.schedulePendingSyncFlush();
+            }
+        });
+        this.databaseObserver.observe(document.body, {
+            childList: true,
+            subtree: true,
+        });
+    }
+
+    private stopDatabaseObserver() {
+        this.databaseObserver?.disconnect();
+        this.databaseObserver = undefined;
+        window.clearTimeout(this.pendingSyncFlushTimer);
+    }
+
+    private hasAVElementNode(nodes: NodeList) {
+        return Array.from(nodes).some((node) => {
+            if (!(node instanceof HTMLElement)) {
+                return false;
+            }
+
+            return node.matches(".av[data-av-id]") || !!node.querySelector(".av[data-av-id]");
+        });
     }
 
     private handleDocumentImageMutations(records: MutationRecord[]) {
@@ -1038,24 +1250,184 @@ export default class DbContentImagesPlugin extends Plugin {
         }, AUTO_SYNC_DELAY_MS);
     }
 
+    private schedulePendingSyncFlush(delay = AUTO_SYNC_DELAY_MS) {
+        if (!this.settingsData.autoSyncVisible || this.pendingSyncData.items.length === 0) {
+            return;
+        }
+
+        window.clearTimeout(this.pendingSyncFlushTimer);
+        this.pendingSyncFlushTimer = window.setTimeout(() => {
+            this.flushPendingSyncWithOpenedDatabases().catch((error) => this.showError(error));
+        }, delay);
+    }
+
     private async flushPendingDocumentSync() {
+        if (this.documentSyncRunning) {
+            return;
+        }
+
         const blockIDs = Array.from(this.pendingDocumentSyncIDs);
         this.pendingDocumentSyncIDs.clear();
         if (blockIDs.length === 0) {
             return;
         }
 
-        const openTargetResult = await this.syncDatabaseItemsForBlocks(blockIDs, false, true);
-        if (openTargetResult.matchedItems > 0) {
+        this.documentSyncRunning = true;
+        try {
+            const context = await this.resolveBoundDocumentSyncContext(blockIDs);
+            if (context.boundItems.length === 0) {
+                return;
+            }
+
+            const avIDs = new Set(context.boundItems.map((item) => item.avID));
+            const openTargetResult = await this.syncDatabaseItemsForContextIDs(context.contextIDs, false, true, avIDs);
+            if (openTargetResult.matchedItems > 0 && !openTargetResult.skipped) {
+                return;
+            }
+
+            let directCompleted = false;
+            try {
+                const boundResult = await this.syncBoundAttributeViewEntries(context.entries);
+                directCompleted = boundResult.scanned > 0 && !boundResult.skipped;
+            } catch (error) {
+                console.debug(`[${this.name}] bound automatic sync failed`, error);
+            }
+
+            if (openTargetResult.matchedItems > 0 && directCompleted) {
+                return;
+            }
+
+            await this.enqueuePendingDocumentSync(blockIDs, context.contextIDs, context.boundItems);
+        } finally {
+            this.documentSyncRunning = false;
+            if (this.pendingDocumentSyncIDs.size > 0) {
+                window.clearTimeout(this.autoSyncTimer);
+                this.autoSyncTimer = window.setTimeout(() => {
+                    this.flushPendingDocumentSync().catch((error) => this.showError(error));
+                }, AUTO_SYNC_DELAY_MS);
+            }
+        }
+    }
+
+    private async enqueuePendingDocumentSync(blockIDs: string[], contextIDs: string[], boundItems: PendingBoundItem[]) {
+        const changedBlockIDs = Array.from(new Set(blockIDs.filter(Boolean)));
+        const normalizedContextIDs = Array.from(new Set(contextIDs.filter(Boolean)));
+        const normalizedBoundItems = this.deduplicatePendingBoundItems(boundItems);
+        if (changedBlockIDs.length === 0 || normalizedContextIDs.length === 0 || normalizedBoundItems.length === 0) {
             return;
         }
 
-        const openResult = await this.syncDatabaseElements(false, true);
-        if (openResult.databases > 0) {
+        const now = Date.now();
+        const itemsByKey = new Map<string, PendingSyncItem>();
+        for (const item of this.pendingSyncData.items) {
+            itemsByKey.set(this.getPendingSyncItemKey(item.changedBlockID, item.boundItems), item);
+        }
+
+        for (const changedBlockID of changedBlockIDs) {
+            const key = this.getPendingSyncItemKey(changedBlockID, normalizedBoundItems);
+            const existing = itemsByKey.get(key);
+            itemsByKey.set(key, {
+                changedBlockID,
+                contextIDs: normalizedContextIDs,
+                boundItems: normalizedBoundItems,
+                updatedAt: now,
+                attempts: existing?.attempts || 0,
+            });
+        }
+
+        this.pendingSyncData = {items: Array.from(itemsByKey.values())};
+        this.prunePendingSyncData();
+        await this.savePendingSyncData();
+        this.schedulePendingSyncFlush(0);
+    }
+
+    private async flushPendingSyncWithOpenedDatabases() {
+        if (this.pendingSyncRunning || !this.settingsData.autoSyncVisible) {
             return;
         }
 
-        await this.syncChangedDocumentBlocks(blockIDs);
+        if (this.prunePendingSyncData()) {
+            await this.savePendingSyncData();
+        }
+        if (this.pendingSyncData.items.length === 0) {
+            return;
+        }
+
+        this.pendingSyncRunning = true;
+        try {
+            const contextIDSet = new Set<string>();
+            const avIDs = new Set<string>();
+            for (const item of this.pendingSyncData.items) {
+                item.contextIDs.forEach((id) => contextIDSet.add(id));
+                item.boundItems.forEach((boundItem) => avIDs.add(boundItem.avID));
+            }
+
+            const contextIDs = Array.from(contextIDSet);
+            const result = await this.syncDatabaseItemsForContextIDs(contextIDs, false, true, avIDs);
+            const matchedContextIDs = new Set(result.matchedContextIDs);
+            let changedQueue = false;
+
+            if (matchedContextIDs.size > 0 && !result.skipped) {
+                const remaining = this.pendingSyncData.items.filter((item) =>
+                    !item.contextIDs.some((id) => matchedContextIDs.has(id)));
+                changedQueue = remaining.length !== this.pendingSyncData.items.length;
+                this.pendingSyncData = {items: remaining};
+            } else {
+                this.pendingSyncData = {
+                    items: this.pendingSyncData.items.map((item) => ({
+                        ...item,
+                        attempts: item.attempts + 1,
+                    })),
+                };
+                changedQueue = true;
+            }
+
+            if (this.prunePendingSyncData()) {
+                changedQueue = true;
+            }
+            if (changedQueue) {
+                await this.savePendingSyncData();
+            }
+        } finally {
+            this.pendingSyncRunning = false;
+        }
+    }
+
+    private deduplicatePendingBoundItems(items: PendingBoundItem[]) {
+        const deduped: PendingBoundItem[] = [];
+        const seen = new Set<string>();
+        for (const item of items) {
+            const key = this.getPendingBoundItemKey(item);
+            if (seen.has(key)) {
+                continue;
+            }
+
+            seen.add(key);
+            deduped.push(item);
+        }
+        return deduped;
+    }
+
+    private getPendingSyncItemKey(changedBlockID: string, boundItems: PendingBoundItem[]) {
+        const boundKey = boundItems
+            .map((item) => this.getPendingBoundItemKey(item))
+            .sort()
+            .join(",");
+        return `${changedBlockID}|${boundKey}`;
+    }
+
+    private prunePendingSyncData() {
+        const now = Date.now();
+        const before = this.pendingSyncData.items.length;
+        let items = this.pendingSyncData.items
+            .filter((item) => now - item.updatedAt <= PENDING_SYNC_TTL_MS)
+            .sort((left, right) => right.updatedAt - left.updatedAt);
+        if (items.length > PENDING_SYNC_MAX_ITEMS) {
+            items = items.slice(0, PENDING_SYNC_MAX_ITEMS);
+        }
+
+        this.pendingSyncData = {items};
+        return before !== items.length;
     }
 
     private getDocumentMutationBlockIDs(detail: unknown) {
