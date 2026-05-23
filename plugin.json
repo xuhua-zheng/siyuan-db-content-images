@@ -16,8 +16,8 @@
     "zh_CN": "数据库内容图"
   },
   "description": {
-    "default": "Sync images in bound notes to a database asset field.",
-    "zh_CN": "将数据库行绑定笔记中的图片同步到资源字段。"
+    "default": "Sync document images to their bound database asset field.",
+    "zh_CN": "将文档中的图片同步到其所属数据库的资源字段。"
   },
   "readme": {
     "default": "README.md",

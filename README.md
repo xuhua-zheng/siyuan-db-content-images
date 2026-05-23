@@ -1,21 +1,38 @@
 # DB Content Images
 
-Sync images inserted in a bound note/block into a SiYuan database asset field.
+DB Content Images syncs document images to the asset field of their bound SiYuan database. It is useful for literature databases, material collections, project trackers, and other databases that need image previews from the bound note content.
+
+The plugin stores only paths or links to existing image assets. It does not copy images or create new attachment files.
+
+## Features
+
+- Manual sync: right-click a database item and run `Plugin > Sync Content Images` to write images from the bound document into the asset field.
+- Auto-sync: after enabling `Auto-sync document images`, document image additions, replacements, and confirmed deletions are synced to bound database items.
+- Delayed retry: if the matching database is not open when the document changes, the plugin stores the bound item in a pending queue and retries when the database opens.
+- Empty-result guard: the asset field is cleared only when persisted document content confirms there are no images, avoiding false clears caused by editor re-rendering or virtual scrolling.
 
 ## Usage
 
 1. Create an asset field in the target database. The default field name is `内容图`.
-2. Add notes or blocks to the database.
+2. Add the document or block whose images you want to sync to that database.
 3. Right-click a database item and run `Plugin > Sync Content Images`, or run `Sync Current DB Content Images` from the command palette.
-4. To use a different field, change `Asset field name` in the plugin settings.
-5. Enable `Auto-sync document images` if you want bound database items to update after document image changes.
+4. To use a different asset field, change `Asset field name` in the plugin settings.
+5. To sync after document image changes, enable `Auto-sync document images` in the plugin settings.
 
-The plugin reads the bound block for each database row, extracts Markdown images, HTML images, and indexed asset images, then writes them to the configured asset field.
+When auto-sync is triggered, the plugin first checks whether the changed block or current document root is bound to a database item. Unbound documents are skipped silently: they are not stored in the pending queue and do not trigger scans or refreshes of opened databases. When a binding exists, the plugin first syncs matching opened database items, then tries a direct bound-item write; if the bound item cannot be synced immediately, it is saved in a cross-restart pending queue and retried when the matching database opens.
 
-Auto-sync listens for document image changes. After a trigger, it first checks whether the changed block or current document root is bound to any database item. Unbound documents are skipped silently: they are not stored in the pending queue and do not trigger scans or refreshes of opened databases. When a binding exists, the plugin first syncs matching opened database items, then tries a direct bound-item write; if the bound item cannot be synced immediately, it is saved in a cross-restart pending queue and retried when the matching database opens. Auto-sync reads persisted document content first, so confirmed image deletion clears the asset field; it still avoids clearing existing asset values just because the editor re-rendered, virtual scrolling unloaded DOM nodes, or one uncertain collection pass returned empty. The plugin only stores links/paths to existing image assets; it does not copy or create attachment files.
+Use a dedicated asset field such as `内容图`. `Replace existing assets` only affects manual sync from the database context menu or command palette; auto-sync clears confirmed empty document content and otherwise keeps the empty-result guard enabled.
 
-Use a dedicated asset field for this. `Replace existing assets` only affects manual sync from the database context menu or command palette; auto-sync clears confirmed empty document content and otherwise keeps the empty-result guard enabled.
+## Notes
 
-## Limitation
+This plugin was mainly generated with AI and is tested, adjusted, published, and maintained by the author. It uses public SiYuan APIs and does not modify the SiYuan kernel, so it cannot add native database column settings or native toggles to the field menu.
 
-Plugins cannot add a native SiYuan database field setting. This plugin uses public APIs to synchronize a normal asset field, which makes it suitable for a no-kernel-change packaged plugin.
+Contact:
+
+`1092242849@qq.com`
+
+If this plugin helps you, support is welcome:
+
+| WeChat Pay | Alipay |
+| --- | --- |
+| <img src="/plugins/siyuan-db-content-images/assets/wechat-pay.png" width="260" alt="WeChat Pay QR code"> | <img src="/plugins/siyuan-db-content-images/assets/alipay.jpg" width="260" alt="Alipay QR code"> |

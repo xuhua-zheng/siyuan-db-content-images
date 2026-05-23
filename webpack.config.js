@@ -22,6 +22,7 @@ module.exports = (env, argv) => {
             patterns: [
                 {from: "preview.png", to: "./dist/"},
                 {from: "icon.png", to: "./dist/"},
+                {from: "assets/", to: "./dist/assets/"},
                 {from: "README*.md", to: "./dist/"},
                 {from: "plugin.json", to: "./dist/"},
                 {from: "src/i18n/", to: "./dist/i18n/"},
