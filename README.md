@@ -8,7 +8,7 @@ The plugin stores only paths or links to existing image assets. It does not copy
 
 - Manual sync: right-click a database item and run `Plugin > Sync Content Images` to write images from the bound document into the asset field.
 - Auto-sync: after enabling `Auto-sync document images`, document image additions, replacements, and confirmed deletions are synced to bound database items.
-- Delayed retry: if the matching database is not open when the document changes, the plugin stores the bound item in a pending queue and retries when the database opens.
+- Direct write: auto-sync writes through SiYuan attribute-view APIs and does not require the database page to be open.
 - Empty-result guard: the asset field is cleared only when persisted document content confirms there are no images, avoiding false clears caused by editor re-rendering or virtual scrolling.
 
 ## Usage
@@ -19,7 +19,7 @@ The plugin stores only paths or links to existing image assets. It does not copy
 4. To use a different asset field, change `Asset field name` in the plugin settings.
 5. To sync after document image changes, enable `Auto-sync document images` in the plugin settings.
 
-When auto-sync is triggered, the plugin first checks whether the changed block or current document root is bound to a database item. Unbound documents are skipped silently: they are not stored in the pending queue and do not trigger scans or refreshes of opened databases. When a binding exists, the plugin first syncs matching opened database items, then tries a direct bound-item write; if the bound item cannot be synced immediately, it is saved in a cross-restart pending queue and retried when the matching database opens.
+When auto-sync is triggered, the plugin first checks whether the changed block or current document root is bound to a database item. Unbound documents are skipped silently and do not trigger scans or refreshes of opened databases. When a binding exists, the plugin resolves the database ID, bound block ID, real item ID, and target asset field, then writes directly through `/api/av/*`. If the direct write fails, modify the image again or use manual sync to trigger another write.
 
 Use a dedicated asset field such as `内容图`. `Replace existing assets` only affects manual sync from the database context menu or command palette; auto-sync clears confirmed empty document content and otherwise keeps the empty-result guard enabled.
 
